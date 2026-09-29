@@ -28,28 +28,56 @@ func OpenStore(path string) (*Store, error) {
 	return &Store{path: path}, nil
 }
 
-// Load 读取全部实例状态；文件不存在时返回空集合。
-func (s *Store) Load() (map[string]*Instance, error) {
+// State 是持久化文件的完整内容：实例状态 + 运行时展开批次记录。
+type State struct {
+	Instances map[string]*Instance
+	Emissions map[string]*Emission
+}
+
+// Load 读取全部持久化状态；文件不存在时返回空集合。
+func (s *Store) Load() (*State, error) {
 	data, err := os.ReadFile(s.path)
 	if errors.Is(err, fs.ErrNotExist) {
-		return map[string]*Instance{}, nil
+		return &State{Instances: map[string]*Instance{}, Emissions: map[string]*Emission{}}, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("read store: %w", err)
 	}
-	out := map[string]*Instance{}
+	st := &State{Instances: map[string]*Instance{}, Emissions: map[string]*Emission{}}
 	if len(data) == 0 {
-		return out, nil
+		return st, nil
 	}
-	if err := json.Unmarshal(data, &out); err != nil {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(data, &top); err != nil {
 		return nil, fmt.Errorf("decode store: %w", err)
 	}
-	return out, nil
+	if raw, ok := top["Instances"]; ok {
+		if err := json.Unmarshal(raw, &st.Instances); err != nil {
+			return nil, fmt.Errorf("decode instances: %w", err)
+		}
+		if raw, ok := top["Emissions"]; ok {
+			if err := json.Unmarshal(raw, &st.Emissions); err != nil {
+				return nil, fmt.Errorf("decode emissions: %w", err)
+			}
+		}
+	} else {
+		// 兼容旧版本格式：文件内容直接是 map[instanceKey]*Instance。
+		if err := json.Unmarshal(data, &st.Instances); err != nil {
+			return nil, fmt.Errorf("decode legacy store: %w", err)
+		}
+	}
+	if st.Instances == nil {
+		st.Instances = map[string]*Instance{}
+	}
+	if st.Emissions == nil {
+		st.Emissions = map[string]*Emission{}
+	}
+	return st, nil
 }
 
-// Save 全量写入实例状态（先写临时文件再原子替换）。
-func (s *Store) Save(instances map[string]*Instance) error {
-	data, err := json.MarshalIndent(instances, "", "  ")
+// Save 全量写入状态（先写临时文件再原子替换）。
+func (s *Store) Save(st *State) error {
+	data, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode store: %w", err)
 	}
