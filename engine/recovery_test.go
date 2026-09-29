@@ -9,7 +9,9 @@ import (
 
 // TestRecoveryAfterRestart 模拟进程重启：
 //   - SUCCEEDED 实例不得重复执行；
-//   - 崩溃时处于 RUNNING 的实例恢复为 FAILED(ErrInterrupted)，语义确定可解释。
+//   - 崩溃时处于 RUNNING 的实例恢复为 INTERRUPTED(ErrInterrupted)：
+//     明确表示“上次执行到一半被打断”，区别于失败后等待重试的 RETRY_WAIT；
+//   - 重触发后 INTERRUPTED 实例重置重跑，SUCCEEDED 仍不重跑。
 func TestRecoveryAfterRestart(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/state.json"
@@ -66,8 +68,8 @@ func TestRecoveryAfterRestart(t *testing.T) {
 	if done.Status != StatusSucceeded {
 		t.Fatalf("done=%s, want SUCCEEDED", done.Status)
 	}
-	if stuck.Status != StatusFailed || stuck.LastError != ErrInterrupted.Error() {
-		t.Fatalf("stuck=%s reason=%q, want FAILED/%q", stuck.Status, stuck.LastError, ErrInterrupted)
+	if stuck.Status != StatusInterrupted || stuck.LastError != ErrInterrupted.Error() {
+		t.Fatalf("stuck=%s reason=%q, want INTERRUPTED/%q", stuck.Status, stuck.LastError, ErrInterrupted)
 	}
 
 	// 恢复后重新触发同一逻辑键：SUCCEEDED 实例不得重跑，
