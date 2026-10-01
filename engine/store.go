@@ -28,16 +28,18 @@ func OpenStore(path string) (*Store, error) {
 	return &Store{path: path}, nil
 }
 
-// State 是持久化的完整状态：实例表 + 运行时展开台账。
+// State 是持久化的完整状态：实例表 + 运行时展开台账 + 展开任务定义。
 type State struct {
-	Instances  map[string]*Instance
-	Expansions map[string]*ExpansionRecord
+	Instances    map[string]*Instance
+	Expansions   map[string]*ExpansionRecord
+	DynamicSpecs map[string]*DynamicSpec
 }
 
 // persistedState 是磁盘上的 JSON 结构。
 type persistedState struct {
-	Instances  map[string]*Instance        `json:"instances"`
-	Expansions map[string]*ExpansionRecord `json:"expansions"`
+	Instances    map[string]*Instance        `json:"instances"`
+	Expansions   map[string]*ExpansionRecord `json:"expansions"`
+	DynamicSpecs map[string]*DynamicSpec     `json:"dynamic_specs,omitempty"`
 }
 
 // Load 读取全部持久化状态；文件不存在时返回空集合。
@@ -45,13 +47,13 @@ type persistedState struct {
 func (s *Store) Load() (*State, error) {
 	data, err := os.ReadFile(s.path)
 	if errors.Is(err, fs.ErrNotExist) {
-		return &State{Instances: map[string]*Instance{}, Expansions: map[string]*ExpansionRecord{}}, nil
+		return &State{Instances: map[string]*Instance{}, Expansions: map[string]*ExpansionRecord{}, DynamicSpecs: map[string]*DynamicSpec{}}, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("read store: %w", err)
 	}
 	if len(data) == 0 {
-		return &State{Instances: map[string]*Instance{}, Expansions: map[string]*ExpansionRecord{}}, nil
+		return &State{Instances: map[string]*Instance{}, Expansions: map[string]*ExpansionRecord{}, DynamicSpecs: map[string]*DynamicSpec{}}, nil
 	}
 	var st persistedState
 	if err := json.Unmarshal(data, &st); err == nil && (st.Instances != nil || st.Expansions != nil) {
@@ -61,14 +63,17 @@ func (s *Store) Load() (*State, error) {
 		if st.Expansions == nil {
 			st.Expansions = map[string]*ExpansionRecord{}
 		}
-		return &State{Instances: st.Instances, Expansions: st.Expansions}, nil
+		if st.DynamicSpecs == nil {
+			st.DynamicSpecs = map[string]*DynamicSpec{}
+		}
+		return &State{Instances: st.Instances, Expansions: st.Expansions, DynamicSpecs: st.DynamicSpecs}, nil
 	}
 	// 旧版本布局：顶层直接是 map[实例键]*Instance。
 	legacy := map[string]*Instance{}
 	if err := json.Unmarshal(data, &legacy); err != nil {
 		return nil, fmt.Errorf("decode store: %w", err)
 	}
-	return &State{Instances: legacy, Expansions: map[string]*ExpansionRecord{}}, nil
+	return &State{Instances: legacy, Expansions: map[string]*ExpansionRecord{}, DynamicSpecs: map[string]*DynamicSpec{}}, nil
 }
 
 // Save 全量写入状态（先写临时文件再原子替换）。
@@ -79,7 +84,10 @@ func (s *Store) Save(st *State) error {
 	if st.Expansions == nil {
 		st.Expansions = map[string]*ExpansionRecord{}
 	}
-	data, err := json.MarshalIndent(persistedState{Instances: st.Instances, Expansions: st.Expansions}, "", "  ")
+	if st.DynamicSpecs == nil {
+		st.DynamicSpecs = map[string]*DynamicSpec{}
+	}
+	data, err := json.MarshalIndent(persistedState{Instances: st.Instances, Expansions: st.Expansions, DynamicSpecs: st.DynamicSpecs}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode store: %w", err)
 	}

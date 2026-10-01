@@ -42,14 +42,19 @@ RETRY_WAIT --进程重启--> RETRY_WAIT（预算与等待计划原样保留，�
   耗尽后进入 `FAILED` 终态，`LastError` 记录最后一次错误。
 - **持久化**：每次状态迁移后全量落盘（JSON，临时文件 + rename 原子写入）。
   `RETRY_WAIT` 落盘内容包含 `Attempts`（已用次数）、`MaxAttempts`（总预算）、
-  `NextAttemptAt`（下一次重试的绝对时刻）与 `Backoff`。
+  `NextAttemptAt`（下一次重试的绝对时刻）与 `Backoff`。运行时展开的任务**定义**
+  （依赖、重试参数）同样随状态落盘（`dynamic_specs`）；执行体 `Run` 是闭包、
+  无法持久化，重启后先以 `Run == nil` 的占位定义恢复，等待重新绑定（见下文）。
 - **重启恢复**（`Open` 时），两类“没跑完”的状态严格区分：
   - 崩溃时处于 `RUNNING`：副作用不可知，标记 **`INTERRUPTED`**
     （原因 `ErrInterrupted`），表示“上次执行到一半被打断”；
   - 崩溃时处于 `RETRY_WAIT`：**保持 `RETRY_WAIT`**，已用/剩余重试次数和
     原等待计划原样保留。重触发时由新进程接管等待，剩余时间从原计划时刻
     继续计算——不会清零次数，也不会重启后立刻重试；
-  - `PENDING` 保持不变；`SUCCEEDED` 实例绝不重复执行。
+  - `PENDING` 保持不变；`SUCCEEDED` 实例绝不重复执行；
+  - 恢复时来源上游已处于失败终态（含刚打出的 `INTERRUPTED`）的展开任务，
+    立即标记 `BLOCKED` 并点名上游（多级展开链逐级级联），重启后第一眼就能
+    看出归属，不会卡在 `PENDING` 或被误判为 `FAILED`。
 - **重触发恢复**：对全部处于终态且存在失败的逻辑键再次触发时，仅将
   `FAILED`/`BLOCKED`/`INTERRUPTED` 实例重置为 `PENDING` 重跑（重试计数清零，
   视为新一轮执行）；重启遗留的 `RETRY_WAIT` 则按上面的接管逻辑延续等待；
@@ -94,6 +99,34 @@ RETRY_WAIT --进程重启--> RETRY_WAIT（预算与等待计划原样保留，�
   拖垮，而不是一直挂起或凭空消失。展开链中任一任务失败，其后续任务级联
   `BLOCKED`。整个链路并发运行时该先后关系由调度状态机统一保证。
 
+### 展开任务的重启恢复
+
+上游已展开出一批后续任务、但这些任务尚未执行完时进程退出，重启后同一天再跑：
+
+- **定义恢复与重新绑定**：展开任务的定义（依赖、重试上限、退避）已随状态
+  落盘，重启后先以占位定义恢复。执行体需要在新进程重新提供，有两条途径：
+  1. 上游重跑并再次 `Emit`/`EmitBatch` 同一批时自动重新绑定——**即使该来源
+     已在台账中（命中去重）也会先完成绑定**，随后已存在的展开实例照常被
+     调度执行；
+  2. 应用在重触发前用同一 ID 调用 `Submit` 提供定义（视为重新绑定，不会把
+     该任务变成静态任务，其他业务日期仍不会实例化它）。
+  若重触发时定义仍未绑定，相关实例以明确原因失败（dynamic task ... definition
+  not re-registered after restart），而不会被误判成“未知任务”后永久搁置；
+  补提交定义后再次触发即可恢复。
+- **已展开任务继续跑完**：重触发只重置失败终态实例；上游 `INTERRUPTED` 后
+  重跑成功、又把同一批任务报一遍时，去重台账保证只算一次、实例不重复创建，
+  但已展开的任务会按正常先后顺序真正执行到最终结果——不会永久失败，
+  也不会凭空消失。上游重跑最终失败（或再次被打断）时，已展开任务仍是
+  `BLOCKED` 且点名上游，不抢跑、不挂起。
+- **重试预算跨重启延续**：展开任务失败后处于 `RETRY_WAIT` 时重启，恢复后
+  仍是 `RETRY_WAIT`（区别于 `INTERRUPTED`），`Attempts`/`MaxAttempts` 与
+  原定 `NextAttemptAt` 原样保留；重新绑定定义并重触发后，接着原计划时刻
+  等待并执行下一次尝试，不清零次数、不立刻重试、也不会直接判死。
+- **来源与作用范围不丢**：实例的 `Origin`（上游任务/实例键/执行序号/批次/
+  逻辑键）随实例持久化；`Expansions(day)` 多天运行时仍各自只见当天记录，
+  同一来源（逻辑键 + 上游实例键 + 上游执行序号 + 批次）跨重启重复产出
+  仍然只登记一次。
+
 ## 验证方法
 
 ```bash
@@ -118,4 +151,16 @@ go test ./... -race -count=1 -v
 - `TestExpansionScopedByLogicalKey`：不同业务日期的展开互不干扰、补跑隔离；
 - `TestEmittedTaskOrderingAndUpstreamFailure`：展开任务天然排在上游成功之后，
   上游失败时已展开任务 `BLOCKED`（点名上游）；
-- `TestEmittedChainFailurePropagates`：展开链中任务失败的级联 `BLOCKED` 归属。
+- `TestEmittedChainFailurePropagates`：展开链中任务失败的级联 `BLOCKED` 归属；
+- `TestExpansionAlreadyEmittedResumesAcrossRestart`：重启前已展开但未执行的
+  任务在重启后上游重新产出（命中来源去重）时继续按顺序执行到成功，台账只算一次；
+- `TestExpandedRetryBudgetSurvivesRestart`：展开任务退避等待中重启后，
+  `RETRY_WAIT`、已用/剩余重试次数与原定重试时刻延续，不立即重试、不清零；
+- `TestExpansionMultiDayAndDedupAcrossRestart`：重启后多天展开结果按日期隔离、
+  同来源重复产出（含跨重启）只登记一次、各任务只执行一次；
+- `TestExpansionUpstreamFailsAfterRestart`：重启后上游重跑最终失败时，
+  已展开任务仍被明确标记为 `BLOCKED` 并点名上游，不抢跑、不挂起；
+- `TestExpandedDefinitionRebindViaSubmit`：重启后通过 `Submit` 重新提供展开
+  任务定义（重新绑定）即可继续执行，且该任务仍是动态任务、不泄漏到其他日期；
+- `TestExpandedUnboundDefinitionFailsClearly`：定义未重新绑定时展开任务得到
+  明确失败（not re-registered after restart），不被误判未知任务、不挂死。

@@ -95,6 +95,16 @@ type ExpansionOrigin struct {
 	EmittedAt     time.Time
 }
 
+// DynamicSpec 是运行时展开任务定义中可持久化的部分。
+// 执行体 Run 是闭包、无法落盘：重启后一律以 nil-Run 的占位定义恢复，
+// 由应用重新 Submit 同一 ID，或上游重跑再次 Emit 时完成重新绑定
+// （落盘定义恒为“待重新绑定”状态，不需要额外标志位）。
+type DynamicSpec struct {
+	Deps       []string      `json:"deps"`
+	MaxRetries int           `json:"max_retries"`
+	Backoff    time.Duration `json:"backoff"`
+}
+
 // ExpansionRecord 是一条“来源 -> 展开结果”的可追溯记录。
 // 唯一去重键为 (LogicalKey, EmitterKey, Attempt, BatchID)：
 // 同一来源重复上报同一批任务按一次登记，不会越跑越多。

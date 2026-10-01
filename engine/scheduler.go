@@ -26,6 +26,7 @@ type Engine struct {
 	store      *Store
 	specs      map[string]TaskSpec
 	staticIDs  map[string]bool // Submit 注册的静态任务 ID；运行时 Emit 的任务不在其中
+	dynamicIDs map[string]bool // 运行时展开出的任务 ID（定义已持久化，重启后先以占位定义恢复）
 	instances  map[string]*Instance
 	expansions map[string]*ExpansionRecord // 展开台账（键为 dedupKey）
 	owned      map[string]bool             // 本进程持有执行/退避 goroutine 的实例键
@@ -50,12 +51,28 @@ func Open(storePath string) (*Engine, error) {
 		store:      store,
 		specs:      map[string]TaskSpec{},
 		staticIDs:  map[string]bool{},
+		dynamicIDs: map[string]bool{},
 		instances:  st.Instances,
 		expansions: st.Expansions,
 		owned:      map[string]bool{},
 		changed:    make(chan struct{}, 1),
 		closeCh:    make(chan struct{}),
 		logf:       log.Printf,
+	}
+	// 恢复运行时展开的任务定义：Run 闭包无法持久化，先安装 nil-Run 占位定义
+	// （Deps/重试预算随定义落盘）。等待应用重新 Submit 同一 ID，
+	// 或上游重跑再次 Emit 时完成重新绑定；绑定前调度到它会给出明确失败而非误判“未知任务”。
+	for id, ds := range st.DynamicSpecs {
+		if ds == nil {
+			ds = &DynamicSpec{}
+		}
+		e.specs[id] = TaskSpec{
+			ID:         id,
+			Deps:       append([]string{}, ds.Deps...),
+			MaxRetries: ds.MaxRetries,
+			Backoff:    ds.Backoff,
+		}
+		e.dynamicIDs[id] = true
 	}
 	// 恢复语义：
 	//   - RUNNING：执行到一半进程退出、副作用不可知，标记 INTERRUPTED（确定可解释）；
@@ -68,10 +85,39 @@ func Open(storePath string) (*Engine, error) {
 			e.transitionLocked(inst, StatusInterrupted, ErrInterrupted.Error())
 		}
 	}
+	// 恢复后立刻交代失败归属：上游已处于失败终态（含本次重启打出的
+	// INTERRUPTED）时，仍在等待的展开任务直接标记 BLOCKED 并点名上游，
+	// 不会卡在 PENDING 或被误判成 FAILED。
+	e.cascadeBlockedAfterRecoveryLocked()
 	if err := e.persistLocked(); err != nil {
 		return nil, err
 	}
 	return e, nil
+}
+
+// cascadeBlockedAfterRecoveryLocked 在重启恢复阶段把“来源上游已处于失败终态”
+// 的 PENDING 展开任务标记为 BLOCKED（不动点迭代：展开链上多级任务在同一轮
+// 恢复中也能逐级交代归属）。仅处理静态调度循环未运行时无人接管的来源依赖；
+// 显式 Deps 在重触发后的 scheduleLocked 中按同一套规则判定。
+func (e *Engine) cascadeBlockedAfterRecoveryLocked() {
+	for progress := true; progress; {
+		progress = false
+		for _, inst := range e.sortedInstancesLocked() {
+			if inst.Status != StatusPending || inst.Origin.EmitterTaskID == "" {
+				continue
+			}
+			up, ok := e.instances[inst.Origin.EmitterTaskID+"@"+inst.LogicalKey]
+			if !ok {
+				continue
+			}
+			switch up.Status {
+			case StatusFailed, StatusBlocked, StatusInterrupted:
+				e.transitionLocked(inst, StatusBlocked,
+					fmt.Sprintf("%s: upstream %s failed", ErrUpstreamFailed.Error(), up.Key()))
+				progress = true
+			}
+		}
+	}
 }
 
 // SetLogger 替换日志函数（测试用它打印状态流转与判定依据）。
@@ -82,6 +128,10 @@ func (e *Engine) SetLogger(logf func(format string, args ...any)) {
 }
 
 // Submit 注册任务定义，并对静态依赖做成环检测。
+//
+// 对“运行时已展开、重启后只剩占位定义”的任务 ID，Submit 表示应用在新进程
+// 重新提供该定义（重新绑定执行体与重试参数）：定义被更新，但该 ID 仍是动态
+// 任务，不会因为别的逻辑键触发而被静态实例化。
 func (e *Engine) Submit(specs ...TaskSpec) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -89,8 +139,12 @@ func (e *Engine) Submit(specs ...TaskSpec) error {
 		if s.ID == "" {
 			return fmt.Errorf("%w: empty task id", ErrUnknownTask)
 		}
+		if e.dynamicIDs[s.ID] {
+			e.logf("rebind dynamic spec %s after restart", s.ID)
+		} else {
+			e.staticIDs[s.ID] = true
+		}
 		e.specs[s.ID] = s
-		e.staticIDs[s.ID] = true
 	}
 	if cyc := findCycle(e.specs); cyc != nil {
 		return fmt.Errorf("%w: %s", ErrCycle, strings.Join(cyc, " -> "))
@@ -281,7 +335,9 @@ func (e *Engine) scheduleLocked() {
 			}
 			blocked, ready := false, true
 			blockedBy := ""
-			// 显式依赖 + 来源上游（运行时展开任务天然排在产出它的上游之后）。
+			// 显式依赖取“定义当前版本 + 来源上游”的并集（运行时展开任务天然
+			// 排在产出它的上游之后）。重启后占位定义里的 Deps 已随定义落盘，
+			// 重新绑定时取并集不会丢失链路。
 			depIDs := make([]string, 0, len(spec.Deps)+1)
 			depIDs = append(depIDs, spec.Deps...)
 			if inst.Origin.EmitterTaskID != "" && !containsDep(depIDs, inst.Origin.EmitterTaskID) {
@@ -310,6 +366,15 @@ func (e *Engine) scheduleLocked() {
 					fmt.Sprintf("%s: upstream %s failed", ErrUpstreamFailed.Error(), blockedBy))
 				progress = true
 			} else if ready {
+				if spec.Run == nil {
+					// 展开定义在重启后尚未重新绑定（既没 Submit，上游也未重跑
+					// 再次产出）：明确失败，而不是执行 nil 闭包或永久挂起。
+					e.transitionLocked(inst, StatusFailed,
+						fmt.Sprintf("%s: dynamic task %q definition not re-registered after restart",
+							ErrUnknownTask.Error(), inst.TaskID))
+					progress = true
+					continue
+				}
 				inst.Attempts = 1
 				e.transitionLocked(inst, StatusRunning, "")
 				e.owned[inst.Key()] = true
@@ -361,7 +426,11 @@ func (e *Engine) runAttempt(spec TaskSpec, key string) {
 	inst := e.instances[key]
 	attempt := inst.Attempts
 	logicalKey, trig := inst.LogicalKey, inst.Trigger
-	inst.MaxAttempts = spec.MaxRetries + 1
+	// 新一轮执行（重置后 MaxAttempts 已清零）按当前定义初始化总预算；
+	// RETRY_WAIT 跨重启续跑时保留落盘的 MaxAttempts，剩余预算不被重新绑定的定义改写。
+	if inst.MaxAttempts == 0 {
+		inst.MaxAttempts = spec.MaxRetries + 1
+	}
 	e.logf("execute %s attempt=%d/%d", key, attempt, inst.MaxAttempts)
 	e.mu.Unlock()
 
@@ -444,6 +513,19 @@ func (e *Engine) resumeRetryWait(key string) {
 		e.mu.Unlock()
 		return
 	}
+	if spec.Run == nil {
+		// 展开任务的退避等待跨了重启，但应用尚未重新提供执行体：
+		// 不能立刻重试，明确失败交代（应用重新 Submit 后再触发可重跑）。
+		e.transitionLocked(inst, StatusFailed,
+			fmt.Sprintf("%s: dynamic task %q definition not re-registered after restart",
+				ErrUnknownTask.Error(), inst.TaskID))
+		_ = e.persistLocked()
+		e.releaseOwnedLocked(key)
+		e.scheduleLocked()
+		e.signalLocked()
+		e.mu.Unlock()
+		return
+	}
 	inst.Attempts++
 	e.logf("resume %s retry at planned time, next attempt=%d/%d",
 		key, inst.Attempts, inst.MaxAttempts)
@@ -484,31 +566,58 @@ func (e *Engine) emitBatch(tc *TaskContext, specs []TaskSpec, batchID string) er
 		EmittedAt:     time.Now(),
 	}
 	dedup := expansionDedupKey(tc.LogicalKey, emitterKey, tc.Attempt, batchID)
-	if rec, dup := e.expansions[dedup]; dup {
-		e.logf("emit batch dedup hit source=%s attempt=%d batch=%q tasks=%v -> skip",
-			emitterKey, tc.Attempt, batchID, rec.TaskIDs)
-		return nil
-	}
 
-	// 登记动态 spec，并把“发起者”隐式追加为依赖；对全局定义做成环检测。
+	// 先（重新）登记动态 spec：
+	//   - 新 ID：登记为动态任务（dynamicIDs），并把发起者隐式追加为依赖；
+	//   - 重启后只剩 nil-Run 占位定义：以本次产出重新绑定执行体与参数；
+	//   - 已存在的完整定义（静态提交或本进程已绑定的动态任务）：保持不动。
+	// 即使本次上报命中来源去重（重启后上游重跑、重新产出同一批），这一步也必须
+	// 执行：否则已展开的实例仍会因为没有可执行定义而被误判失败、永久不再运行。
 	var added []string
+	rebound := map[string]TaskSpec{}
 	for _, spec := range specs {
 		if spec.ID == "" {
 			return fmt.Errorf("%w: empty emitted task id", ErrUnknownTask)
 		}
-		if _, exists := e.specs[spec.ID]; !exists {
+		old, exists := e.specs[spec.ID]
+		switch {
+		case !exists:
 			if !containsDep(spec.Deps, tc.TaskID) {
 				spec.Deps = append(append([]string{}, spec.Deps...), tc.TaskID)
 			}
 			e.specs[spec.ID] = spec
+			e.dynamicIDs[spec.ID] = true
 			added = append(added, spec.ID)
+		case e.dynamicIDs[spec.ID] && old.Run == nil:
+			rebound[spec.ID] = old
+			if !containsDep(spec.Deps, tc.TaskID) {
+				spec.Deps = append(append([]string{}, spec.Deps...), tc.TaskID)
+			}
+			e.specs[spec.ID] = spec
 		}
 	}
 	if cyc := findCycle(e.specs); cyc != nil {
 		for _, id := range added {
 			delete(e.specs, id)
+			delete(e.dynamicIDs, id)
+		}
+		for id, old := range rebound {
+			e.specs[id] = old
 		}
 		return fmt.Errorf("%w: %s", ErrCycle, strings.Join(cyc, " -> "))
+	}
+
+	if rec, dup := e.expansions[dedup]; dup {
+		e.logf("emit batch dedup hit source=%s attempt=%d batch=%q tasks=%v -> rebind/skip",
+			emitterKey, tc.Attempt, batchID, rec.TaskIDs)
+		// 同来源重复报同一批只算一次：不新增台账记录、不新增实例；
+		// 但重新绑定可能刚生效，落盘并继续驱动那些已展开、待执行的实例。
+		if err := e.persistLocked(); err != nil {
+			return err
+		}
+		e.scheduleLocked()
+		e.signalLocked()
+		return nil
 	}
 
 	emittedIDs := make([]string, 0, len(specs))
@@ -678,7 +787,17 @@ func (e *Engine) signalLocked() {
 }
 
 func (e *Engine) persistLocked() error {
-	return e.store.Save(&State{Instances: e.instances, Expansions: e.expansions})
+	dyn := make(map[string]*DynamicSpec, len(e.dynamicIDs))
+	for id := range e.dynamicIDs {
+		s := e.specs[id]
+		ds := &DynamicSpec{
+			Deps:       append([]string{}, s.Deps...),
+			MaxRetries: s.MaxRetries,
+			Backoff:    s.Backoff,
+		}
+		dyn[id] = ds
+	}
+	return e.store.Save(&State{Instances: e.instances, Expansions: e.expansions, DynamicSpecs: dyn})
 }
 
 func (e *Engine) instancesForKeyLocked(logicalKey string) []*Instance {
