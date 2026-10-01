@@ -28,6 +28,7 @@ type Engine struct {
 	staticIDs  map[string]bool // Submit 注册的静态任务 ID；运行时 Emit 的任务不在其中
 	instances  map[string]*Instance
 	expansions map[string]*ExpansionRecord // 展开台账（键为 dedupKey）
+	dynamicIDs map[string]bool             // 曾作为展开结果出现过的任务 ID（只能由上游产出，不作为根任务自动实例化）
 	owned      map[string]bool             // 本进程持有执行/退避 goroutine 的实例键
 	changed    chan struct{}               // 状态迁移信号（缓冲 1，聚合通知）
 	logf       func(format string, args ...any)
@@ -52,6 +53,7 @@ func Open(storePath string) (*Engine, error) {
 		staticIDs:  map[string]bool{},
 		instances:  st.Instances,
 		expansions: st.Expansions,
+		dynamicIDs: map[string]bool{},
 		owned:      map[string]bool{},
 		changed:    make(chan struct{}, 1),
 		closeCh:    make(chan struct{}),
@@ -68,6 +70,17 @@ func Open(storePath string) (*Engine, error) {
 			e.transitionLocked(inst, StatusInterrupted, ErrInterrupted.Error())
 		}
 	}
+	// 从持久化台账恢复“动态 ID”集合：这些 ID 曾作为展开结果出现，
+	// 重启后即便被 Submit 重新提交定义，也不得作为新逻辑键的根任务自动实例化。
+	for _, rec := range e.expansions {
+		for _, id := range rec.TaskIDs {
+			e.dynamicIDs[id] = true
+		}
+	}
+	// 失败归属在重启后也要一眼可辨：上游被打断后，尚未执行的下游（含重启前
+	// 已展开、spec 可能已丢失的任务）立即级联 BLOCKED 并点名上游，
+	// 而不是卡在 PENDING/挂起。这里只做级联标记，不启动任何执行 goroutine。
+	e.blockDependentsOfTerminalFailuresLocked()
 	if err := e.persistLocked(); err != nil {
 		return nil, err
 	}
@@ -95,7 +108,54 @@ func (e *Engine) Submit(specs ...TaskSpec) error {
 	if cyc := findCycle(e.specs); cyc != nil {
 		return fmt.Errorf("%w: %s", ErrCycle, strings.Join(cyc, " -> "))
 	}
+	// 重启后重新提交定义时，补做一次失败归属级联：
+	// Open 时 specs 尚未载入、只能依据 Origin 处理展开任务；
+	// 静态 Deps 在定义重新就位后也能直接判出被哪条上游拖垮。
+	// 正常进程内 Submit 只发生在触发前，不存在在途上游，故无误判。
+	e.blockDependentsOfTerminalFailuresLocked()
 	return nil
+}
+
+// blockDependentsOfTerminalFailuresLocked 把“上游已处失败终态”的 PENDING 实例
+// （含重启前已展开、spec 可能尚未重新提交的动态任务）级联标记为 BLOCKED，
+// 原因直接点名拖垮它的上游实例。反复迭代到不再产生新的级联为止。
+// 仅做状态标记，不启动任何执行；调用方须持有锁。
+func (e *Engine) blockDependentsOfTerminalFailuresLocked() {
+	for progress := true; progress; {
+		progress = false
+		for _, inst := range e.sortedInstancesLocked() {
+			if inst.Status != StatusPending {
+				continue
+			}
+			depIDs := e.dependencyIDsLocked(inst)
+			for _, dep := range depIDs {
+				di, ok := e.instances[dep+"@"+inst.LogicalKey]
+				if !ok {
+					continue // 依赖尚未登记：交由调度循环按未注册依赖处理
+				}
+				switch di.Status {
+				case StatusFailed, StatusBlocked, StatusInterrupted:
+					e.transitionLocked(inst, StatusBlocked,
+						fmt.Sprintf("%s: upstream %s failed", ErrUpstreamFailed.Error(), di.Key()))
+					progress = true
+				}
+			}
+		}
+	}
+}
+
+// dependencyIDsLocked 汇总实例的显式依赖（来自 spec）与来源上游
+// （运行时展开任务天然排在产出它的上游之后）。重启后 spec 尚未重新提交时，
+// Origin 仍是展开任务可追溯的唯一依赖依据。
+func (e *Engine) dependencyIDsLocked(inst *Instance) []string {
+	var depIDs []string
+	if spec, ok := e.specs[inst.TaskID]; ok {
+		depIDs = append(depIDs, spec.Deps...)
+	}
+	if inst.Origin.EmitterTaskID != "" && !containsDep(depIDs, inst.Origin.EmitterTaskID) {
+		depIDs = append(depIDs, inst.Origin.EmitterTaskID)
+	}
+	return depIDs
 }
 
 // findCycle 对任务定义做 DFS 成环检测，返回一条环路径。
@@ -246,6 +306,12 @@ func (e *Engine) run(ctx context.Context, logicalKey string, trig TriggerType) e
 		}
 	}
 	for id := range e.staticIDs {
+		// 曾作为展开结果出现过的 ID 不是根任务：即使重启后被重新 Submit 了定义，
+		// 也只允许由其来源上游产出，不能在新逻辑键（其他业务日期）下凭空实例化，
+		// 保证“多天运行各自只能看到自己那天的展开结果”。
+		if e.dynamicIDs[id] {
+			continue
+		}
 		spec := e.specs[id]
 		inst := &Instance{
 			TaskID: spec.ID, LogicalKey: logicalKey, Trigger: trig,
@@ -273,20 +339,12 @@ func (e *Engine) scheduleLocked() {
 			if inst.Status != StatusPending {
 				continue
 			}
-			spec, ok := e.specs[inst.TaskID]
-			if !ok {
-				e.transitionLocked(inst, StatusFailed, ErrUnknownTask.Error())
-				progress = true
-				continue
-			}
+			spec, specOK := e.specs[inst.TaskID]
 			blocked, ready := false, true
 			blockedBy := ""
 			// 显式依赖 + 来源上游（运行时展开任务天然排在产出它的上游之后）。
-			depIDs := make([]string, 0, len(spec.Deps)+1)
-			depIDs = append(depIDs, spec.Deps...)
-			if inst.Origin.EmitterTaskID != "" && !containsDep(depIDs, inst.Origin.EmitterTaskID) {
-				depIDs = append(depIDs, inst.Origin.EmitterTaskID)
-			}
+			// 重启后动态 spec 可能尚未重新提交，此时 Origin 仍是唯一可追溯的依赖依据。
+			depIDs := e.dependencyIDsLocked(inst)
 			for _, dep := range depIDs {
 				di, ok := e.instances[dep+"@"+inst.LogicalKey]
 				if !ok {
@@ -310,6 +368,26 @@ func (e *Engine) scheduleLocked() {
 					fmt.Sprintf("%s: upstream %s failed", ErrUpstreamFailed.Error(), blockedBy))
 				progress = true
 			} else if ready {
+				if !specOK {
+					// 定义缺失：重启前由运行时展开的任务，其 TaskSpec（含执行体闭包）
+					// 无法落盘。只要来源上游仍会重跑（非终态），保持 PENDING——
+					// 上游重跑会重新产出定义并重报同一批（台账去重，但定义会补齐），
+					// 任务随后按正常顺序执行，不永久失败、也不凭空消失。
+					if inst.Origin.EmitterTaskID != "" {
+						if em, ok := e.instances[inst.Origin.EmitterTaskID+"@"+inst.LogicalKey]; ok &&
+							!em.Status.IsTerminal() {
+							continue // 等待上游重跑重新供给定义
+						}
+						e.transitionLocked(inst, StatusFailed,
+							ErrUnknownTask.Error()+": emitted task definition \""+inst.TaskID+
+								"\" was not re-registered after restart and its emitter can no longer produce it")
+						progress = true
+						continue
+					}
+					e.transitionLocked(inst, StatusFailed, ErrUnknownTask.Error())
+					progress = true
+					continue
+				}
 				inst.Attempts = 1
 				e.transitionLocked(inst, StatusRunning, "")
 				e.owned[inst.Key()] = true
@@ -436,7 +514,25 @@ func (e *Engine) resumeRetryWait(key string) {
 	}
 	spec, ok := e.specs[inst.TaskID]
 	if !ok {
-		e.transitionLocked(inst, StatusFailed, ErrUnknownTask.Error())
+		// 重启后展开任务的定义（含执行体闭包）尚未被重新提交：
+		// 绝不清零预算、绝不立刻判死。来源上游仍会重跑/补定义就继续等待接管；
+		// 仅当来源已不可能再产出时才给出明确的 FAILED 交代。
+		if inst.Origin.EmitterTaskID != "" {
+			if em, exists := e.instances[inst.Origin.EmitterTaskID+"@"+inst.LogicalKey]; exists &&
+				!em.Status.IsTerminal() {
+				e.logf("retry of %s planned at %s waits for re-registered definition (emitter %s=%s)",
+					key, inst.NextAttemptAt.Format(time.RFC3339Nano), em.Key(), em.Status)
+				e.signalLocked()
+				e.mu.Unlock()
+				go e.awaitDefinitionAndRetry(key)
+				return
+			}
+			e.transitionLocked(inst, StatusFailed,
+				ErrUnknownTask.Error()+": emitted task definition \""+inst.TaskID+
+					"\" was not re-registered after restart and its emitter can no longer produce it")
+		} else {
+			e.transitionLocked(inst, StatusFailed, ErrUnknownTask.Error())
+		}
 		_ = e.persistLocked()
 		e.releaseOwnedLocked(key)
 		e.scheduleLocked()
@@ -451,6 +547,40 @@ func (e *Engine) resumeRetryWait(key string) {
 	e.mu.Unlock()
 	// owned 保持 true：wg 计数由当前 goroutine 持有，runAttempt 终结整条链。
 	e.runAttempt(spec, key)
+}
+
+// awaitDefinitionAndRetry 在“到了预定重试时刻、但重启后定义尚未重新提交”时
+// 接管等待。实例始终保持 RETRY_WAIT：Attempts/MaxAttempts/NextAttemptAt 原样保留，
+// 直到定义被 Submit 补回，再重新走 resumeRetryWait（若原计划时刻已过则立即重试，
+// 剩余等待早已等够）；引擎关闭则交还（状态已落盘，下次继续）。
+func (e *Engine) awaitDefinitionAndRetry(key string) {
+	defer e.wg.Done()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-e.closeCh:
+			e.mu.Lock()
+			e.releaseOwnedLocked(key)
+			e.mu.Unlock()
+			return
+		case <-ticker.C:
+		}
+		e.mu.Lock()
+		inst := e.instances[key]
+		if inst == nil || inst.Status != StatusRetryWait {
+			e.releaseOwnedLocked(key)
+			e.mu.Unlock()
+			return
+		}
+		if _, ok := e.specs[inst.TaskID]; ok {
+			e.mu.Unlock()
+			// 仍持有 wg 计数与 owned：直接复用按计划接管重试的路径。
+			e.resumeRetryWait(key)
+			return
+		}
+		e.mu.Unlock()
+	}
 }
 
 // emitBatch 是 Emit/EmitBatch 的共用实现（调用方持有 tc）。
@@ -484,13 +614,11 @@ func (e *Engine) emitBatch(tc *TaskContext, specs []TaskSpec, batchID string) er
 		EmittedAt:     time.Now(),
 	}
 	dedup := expansionDedupKey(tc.LogicalKey, emitterKey, tc.Attempt, batchID)
-	if rec, dup := e.expansions[dedup]; dup {
-		e.logf("emit batch dedup hit source=%s attempt=%d batch=%q tasks=%v -> skip",
-			emitterKey, tc.Attempt, batchID, rec.TaskIDs)
-		return nil
-	}
+	_, dup := e.expansions[dedup]
 
-	// 登记动态 spec，并把“发起者”隐式追加为依赖；对全局定义做成环检测。
+	// 无论是否命中来源去重，都要保证本批任务的定义存在：
+	// 重启后动态 TaskSpec（含执行体闭包）无法随状态落盘，上游重跑后重新上报
+	// 同一批时会命中台账去重，但定义必须在这里被补回，展开任务才能继续执行。
 	var added []string
 	for _, spec := range specs {
 		if spec.ID == "" {
@@ -503,6 +631,10 @@ func (e *Engine) emitBatch(tc *TaskContext, specs []TaskSpec, batchID string) er
 			e.specs[spec.ID] = spec
 			added = append(added, spec.ID)
 		}
+		if !e.staticIDs[spec.ID] {
+			// 只由展开产出的 ID 不参与新逻辑键的根任务实例化（作用范围隔离）。
+			e.dynamicIDs[spec.ID] = true
+		}
 	}
 	if cyc := findCycle(e.specs); cyc != nil {
 		for _, id := range added {
@@ -512,32 +644,55 @@ func (e *Engine) emitBatch(tc *TaskContext, specs []TaskSpec, batchID string) er
 	}
 
 	emittedIDs := make([]string, 0, len(specs))
-	created := 0
+	revived := 0
 	for _, spec := range specs {
 		emittedIDs = append(emittedIDs, spec.ID)
 		key := spec.ID + "@" + tc.LogicalKey
-		if _, exists := e.instances[key]; exists {
-			continue // 同实例已由其他来源/批次登记：幂等跳过，不覆盖来源
+		inst, exists := e.instances[key]
+		if !exists {
+			// 作用范围：实例只属于本逻辑键（业务日期），其他运行不可见。
+			e.instances[key] = &Instance{
+				TaskID: spec.ID, LogicalKey: tc.LogicalKey, Trigger: tc.Trigger,
+				Status: StatusPending, UpdatedAt: time.Now(), Origin: origin,
+			}
+			continue
 		}
-		// 作用范围：实例只属于本次逻辑键（业务日期），其他运行不可见。
-		e.instances[key] = &Instance{
-			TaskID: spec.ID, LogicalKey: tc.LogicalKey, Trigger: tc.Trigger,
-			Status: StatusPending, UpdatedAt: time.Now(), Origin: origin,
+		// 同实例已由其他来源/批次登记：不覆盖来源。
+		// 但如果它正停在“重启空档”造成的终态（定义曾丢失而被判 FAILED，
+		// 或上游被打断时级联 BLOCKED/INTERRUPTED），而同一来源又把这批任务
+		// 重新报了一遍——说明上游本轮仍在产出它——则复位为 PENDING 继续正常执行。
+		// SUCCEEDED 绝不触碰；RETRY_WAIT 非终态，其重试预算由独立路径延续。
+		if dup && inst.Status != StatusSucceeded && inst.Status.IsTerminal() {
+			e.logf("revive %s after re-emit by %s attempt=%d: %s -> PENDING",
+				key, emitterKey, tc.Attempt, inst.Status)
+			inst.Status = StatusPending
+			inst.Trigger = tc.Trigger
+			inst.LastError = ""
+			inst.Attempts = 0
+			inst.MaxAttempts = 0
+			var zero time.Time
+			inst.NextAttemptAt = zero
+			inst.UpdatedAt = time.Now()
+			revived++
 		}
-		created++
 	}
 	sort.Strings(emittedIDs)
-	e.expansions[dedup] = &ExpansionRecord{
-		EmitterTaskID: tc.TaskID,
-		EmitterKey:    emitterKey,
-		Attempt:       tc.Attempt,
-		BatchID:       batchID,
-		LogicalKey:    tc.LogicalKey,
-		EmittedAt:     origin.EmittedAt,
-		TaskIDs:       emittedIDs,
+	if dup {
+		e.logf("emit batch dedup hit source=%s attempt=%d batch=%q tasks=%v revived=%d -> definitions ensured, no new record",
+			emitterKey, tc.Attempt, batchID, emittedIDs, revived)
+	} else {
+		e.expansions[dedup] = &ExpansionRecord{
+			EmitterTaskID: tc.TaskID,
+			EmitterKey:    emitterKey,
+			Attempt:       tc.Attempt,
+			BatchID:       batchID,
+			LogicalKey:    tc.LogicalKey,
+			EmittedAt:     origin.EmittedAt,
+			TaskIDs:       emittedIDs,
+		}
+		e.logf("emit batch source=%s attempt=%d batch=%q tasks=%v",
+			emitterKey, tc.Attempt, batchID, emittedIDs)
 	}
-	e.logf("emit batch source=%s attempt=%d batch=%q tasks=%v created=%d",
-		emitterKey, tc.Attempt, batchID, emittedIDs, created)
 	if err := e.persistLocked(); err != nil {
 		return err
 	}
